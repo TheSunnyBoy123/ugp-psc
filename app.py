@@ -43,6 +43,15 @@ try:
 except ImportError:
     pass
 
+# Try to import SSH LLM client (optional)
+_SSH_LLM_AVAILABLE = False
+_SSH_CLIENT_INSTANCE = None
+try:
+    from ssh_llm_client import SSHLLMClient
+    _SSH_LLM_AVAILABLE = True
+except ImportError:
+    pass
+
 # ═══════════════════════════════════════════════════════════════
 # PAGE CONFIG
 # ═══════════════════════════════════════════════════════════════
@@ -104,6 +113,138 @@ def _configure_logger() -> logging.Logger:
 
 
 logger = _configure_logger()
+
+
+# ═══════════════════════════════════════════════════════════════
+# SSH TUNNEL MANAGEMENT
+# ═══════════════════════════════════════════════════════════════
+
+def _get_ssh_client():
+    """Get or create the SSH client instance."""
+    global _SSH_CLIENT_INSTANCE
+    if _SSH_CLIENT_INSTANCE is None and _SSH_LLM_AVAILABLE:
+        _SSH_CLIENT_INSTANCE = SSHLLMClient(
+            ssh_host="gpu02.cc.iitk.ac.in",
+            ssh_user="sunrajp23",
+            local_port=8000,
+            remote_port=8000,
+        )
+    return _SSH_CLIENT_INSTANCE
+
+
+def connect_ssh_tunnel(password: str = None) -> tuple[bool, str]:
+    """Establish SSH tunnel connection with optional password.
+    
+    Returns (success, message)
+    """
+    client = _get_ssh_client()
+    if client is None:
+        return False, "SSH client not available"
+    
+    import subprocess
+    
+    ssh_cmd = [
+        "ssh",
+        "-N",
+        "-o", "StrictHostKeyChecking=no",
+        "-o", "ServerAliveInterval=30",
+        "-L", f"{client.local_port}:localhost:{client.remote_port}",
+        f"{client.ssh_user}@{client.ssh_host}",
+    ]
+    
+    try:
+        if password:
+            proc = subprocess.Popen(
+                ["sshpass", "-p", password] + ssh_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        else:
+            proc = subprocess.Popen(
+                ssh_cmd,
+                stdout=subprocess.PIPE,
+                stderr=subprocess.PIPE,
+            )
+        
+        client._proc = proc
+        
+        for i in range(30):
+            time.sleep(1)
+            if proc.poll() is not None:
+                stderr = proc.stderr.read().decode() if proc.stderr else ""
+                return False, f"SSH connection failed: {stderr}"
+            try:
+                import urllib.request
+                urllib.request.urlopen(f"http://localhost:{client.local_port}/v1/models", timeout=2)
+                client._connected = True
+                return True, "SSH tunnel connected successfully"
+            except:
+                continue
+        
+        client._connected = True
+        return True, "SSH tunnel established"
+        
+    except FileNotFoundError as e:
+        if "sshpass" in str(e):
+            return False, "sshpass not installed. Run: brew install sshpass"
+        return False, f"SSH command not found: {e}"
+    except Exception as e:
+        return False, f"Connection error: {e}"
+
+
+def disconnect_ssh_tunnel():
+    """Close SSH tunnel connection."""
+    global _SSH_CLIENT_INSTANCE
+    if _SSH_CLIENT_INSTANCE is not None:
+        if hasattr(_SSH_CLIENT_INSTANCE, "_proc"):
+            _SSH_CLIENT_INSTANCE._proc.terminate()
+        _SSH_CLIENT_INSTANCE._connected = False
+        _SSH_CLIENT_INSTANCE = None
+
+
+# ═══════════════════════════════════════════════════════════════
+# PROCESS STEPS TRACKING
+# ═══════════════════════════════════════════════════════════════
+
+class ProcessSteps:
+    """Track and display processing steps in the UI."""
+    
+    def __init__(self):
+        self.steps = []
+        self.container = None
+    
+    def add(self, step: str, status: str = "pending"):
+        """Add a step with status: pending, running, done, error"""
+        emoji = {"pending": "⏳", "running": "🔄", "done": "✅", "error": "❌"}.get(status, "•")
+        self.steps.append({"step": step, "status": status, "emoji": emoji})
+    
+    def update(self, index: int, status: str):
+        """Update status of a specific step"""
+        if 0 <= index < len(self.steps):
+            self.steps[index]["status"] = status
+            self.steps[index]["emoji"] = {"pending": "⏳", "running": "🔄", "done": "✅", "error": "❌"}.get(status, "•")
+    
+    def render(self, container):
+        """Render steps in a Streamlit container."""
+        for s in self.steps:
+            color = {
+                "pending": "#888888",
+                "running": "#3498db",
+                "done": "#2ecc71",
+                "error": "#e74c3c"
+            }.get(s["status"], "#888888")
+            container.markdown(
+                f'<div style="padding:4px 0;color:{color}">{s["emoji"]} {s["step"]}</div>',
+                unsafe_allow_html=True
+            )
+    
+    def clear(self):
+        """Clear all steps."""
+        self.steps = []
+
+
+# Global process steps instance
+_process_steps = ProcessSteps()
 
 
 # ═══════════════════════════════════════════════════════════════
@@ -237,10 +378,32 @@ def get_llm(use_local: bool = False):
         return _LLM_GEMINI
 
 
-_RotatingLLM = RotatingLLM
+class RotatingLLM:
+    """LLM wrapper that auto-rotates between multiple API keys on quota errors."""
+
+    def __init__(self, keys: list, model: str = "gemini-2.5-flash", temperature: float = 0.1):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        self._keys = keys
+        self._model = model
+        self._temperature = temperature
+        self._key_idx = 0
+        self._banned = set()
+        self._llm = ChatGoogleGenerativeAI(
+            model=model,
+            google_api_key=keys[0],
+            temperature=temperature,
+        )
+        logger.info("[GEMINI]  RotatingLLM initialised with %d key(s)", len(keys))
+
+    def _make_llm(self, key: str):
+        from langchain_google_genai import ChatGoogleGenerativeAI
+        return ChatGoogleGenerativeAI(
+            model=self._model,
+            google_api_key=key,
+            temperature=self._temperature,
+        )
 
     def _is_quota_error(self, e: Exception) -> bool:
-        """Detect free-tier / quota / rate-limit / expired key errors."""
         msg = str(e).lower()
         quota_signals = [
             "429", "resource exhausted", "quota", "rate limit",
@@ -252,19 +415,17 @@ _RotatingLLM = RotatingLLM
         return any(s in msg for s in quota_signals)
 
     def _rotate_key(self) -> bool:
-        """Rotate to next available key. Returns False if all exhausted."""
         self._banned.add(self._key_idx)
         for _ in range(len(self._keys)):
             self._key_idx = (self._key_idx + 1) % len(self._keys)
             if self._key_idx not in self._banned:
                 self._llm = self._make_llm(self._keys[self._key_idx])
-                logger.warning("🔄  Rotated to API key #%d", self._key_idx + 1)
+                logger.warning("Rotated to API key #%d", self._key_idx + 1)
                 return True
-        logger.error("❌  All API keys exhausted!")
+        logger.error("All API keys exhausted!")
         return False
 
     def invoke(self, *args, **kwargs):
-        """Call LLM with automatic key rotation on quota errors."""
         last_error = None
         attempts = 0
         while attempts < len(self._keys):
@@ -273,7 +434,7 @@ _RotatingLLM = RotatingLLM
             except Exception as e:
                 if self._is_quota_error(e):
                     logger.warning(
-                        "⚠️   Key #%d quota/rate error (attempt %d/%d): %s",
+                        "Key #%d quota/rate error (attempt %d/%d): %s",
                         self._key_idx + 1, attempts + 1, len(self._keys), str(e)[:120],
                     )
                     if not self._rotate_key():
@@ -282,10 +443,9 @@ _RotatingLLM = RotatingLLM
                     last_error = e
                 else:
                     logger.error("LLM non-quota error: %s", str(e)[:200])
-                    raise  # non-quota errors propagate immediately
+                    raise
         raise last_error or RuntimeError("All API keys exhausted")
 
-    # Pass-through for any attribute access (e.g., .model_name)
     def __getattr__(self, name):
         return getattr(self._llm, name)
 
@@ -1338,39 +1498,84 @@ document.addEventListener('DOMContentLoaded', function() {
 
     st.markdown("---")
 
+    # ── SSH Tunnel Management ─────────────────────────────────────────────────
+    if _SSH_LLM_AVAILABLE:
+        st.markdown("##### 🔌 SSH GPU Connection")
+        
+        ssh_connected = st.session_state.get("ssh_connected", False)
+        
+        if not ssh_connected:
+            with st.expander("🌐 Connect to GPU Server", expanded=True):
+                st.caption("Connect to gpu02.cc.iitk.ac.in to use local Qwen model")
+                
+                ssh_password = st.text_input(
+                    "Password (for SSH key passphrase if needed)",
+                    type="password",
+                    key="ssh_password",
+                    help="Enter your IITK password if prompted"
+                )
+                
+                col1, col2 = st.columns([1, 1])
+                with col1:
+                    if st.button("🔗 Connect", key="ssh_connect", use_container_width=True):
+                        with st.status("Connecting to GPU server...") as status:
+                            st.write("Establishing SSH tunnel...")
+                            success, msg = connect_ssh_tunnel(ssh_password if ssh_password else None)
+                            if success:
+                                st.session_state.ssh_connected = True
+                                st.session_state.ssh_password = ssh_password
+                                status.update(state="complete", label="✅ Connected")
+                                st.rerun()
+                            else:
+                                status.update(state="error", label="❌ Connection Failed")
+                                st.error(msg)
+                with col2:
+                    st.caption("Or use SSH key if configured")
+        else:
+            st.success("🟢 SSH Tunnel Active")
+            st.caption("Connected to gpu02.cc.iitk.ac.in:8000")
+            
+            if st.button("🔴 Disconnect", key="ssh_disconnect", use_container_width=True):
+                disconnect_ssh_tunnel()
+                st.session_state.ssh_connected = False
+                st.session_state.ssh_password = ""
+                st.rerun()
+    else:
+        st.caption("🔌 SSH client not available")
+
+    st.markdown("---")
+
     # ── Local LLM Toggle ─────────────────────────────────────────────────────
     if _LOCAL_LLM_AVAILABLE:
-        use_local = st.session_state.get("local_llm", False)
-        use_local = st.toggle(
-            "🖥️ Use Local Qwen Model (localhost:8000)",
-            value=use_local,
-            key="local_llm",
-            help="Route LLM inference to local vLLM server (Qwen-Coder-3.5)"
-        )
-        if use_local != st.session_state.get("local_llm"):
-            st.session_state["local_llm"] = use_local
-            st.rerun()
-
-        if use_local:
-            st.info("🖥️ Local Qwen Active — ensure vLLM is running: python -m vllm.entrypoints.openai.api_server --model /scratch/work/sunrajp23/hf_cache/qwen-coder-3.5 --port 8000")
+        ssh_connected = st.session_state.get("ssh_connected", False)
+        
+        if ssh_connected:
+            use_local = st.session_state.get("local_llm", False)
+            use_local = st.toggle(
+                "🖥️ Use Local Qwen Model (via SSH tunnel)",
+                value=use_local,
+                key="local_llm",
+                help="Route LLM inference to GPU server via SSH tunnel"
+            )
+            if use_local:
+                st.success("Using Qwen model on GPU server")
+            else:
+                st.caption("Using Google Gemini API")
         else:
-            st.caption("Using Google Gemini API (gemini-2.5-flash)")
+            st.info("🔗 Connect to GPU server first to use local Qwen model")
+            
+            use_local = st.session_state.get("local_llm", False)
+            use_local = st.toggle(
+                "🖥️ Use Local Qwen Model (localhost:8000)",
+                value=use_local,
+                key="local_llm",
+                help="Route LLM inference to local vLLM server"
+            )
+            
+            if use_local:
+                st.caption("Warning: Ensure vLLM is running locally")
     else:
         st.caption("Local LLM client not available — using Google Gemini API")
-
-        if use_local:
-            st.info("🖥️  Local Qwen Model Active (qwen-coder-3.5 @ localhost:8000)")
-            # Add test connection button
-            try:
-                import urllib.request
-                req = urllib.request.urlopen("http://localhost:8000/", timeout=3)
-                st.success("✅ vLLM server is connected")
-            except Exception:
-                st.error("⚠️  vLLM server not responding (run: python -m vllm.entrypoints.openai.api_server --model qwen-coder-3.5 --port 8000)")
-        else:
-            st.caption("Using Google Gemini API (gemini-2.5-flash)")
-    else:
-        st.caption("Local LLM not available — using Google Gemini API (gemini-2.5-flash)")
 
     st.markdown("---")
     st.markdown("##### 🚀 Quick Queries")
@@ -1733,8 +1938,53 @@ with tab_chat:
 
         # Process and render assistant response
         with st.chat_message("assistant"):
-            with st.spinner("Thinking..."):
-                result = route(prompt)
+            # Create process steps container
+            steps_container = st.container()
+            
+            # Initialize steps for this query
+            steps = [
+                ("🔍 Analyzing query intent", "pending"),
+                ("📊 Generating query plan", "pending"),
+                ("🔎 Retrieving data", "pending"),
+                ("🧠 Processing results", "pending"),
+            ]
+            
+            steps_placeholder = steps_container.empty()
+            for emoji, status in steps:
+                steps_placeholder.markdown(
+                    f'<div style="padding:2px 0;color:#888888">⏳ {emoji}</div>',
+                    unsafe_allow_html=True
+                )
+            
+            # Update step status
+            def update_step(idx, status, emoji_override=None):
+                emoji_map = {"pending": "⏳", "running": "🔄", "done": "✅", "error": "❌"}
+                emoji = emoji_override or emoji_map.get(status, "•")
+                steps[idx] = (steps[idx][0], status, emoji)
+                display = ""
+                for e, s, em in steps:
+                    color = {"pending": "#888888", "running": "#3498db", "done": "#2ecc71", "error": "#e74c3c"}.get(s, "#888888")
+                    display += f'<div style="padding:2px 0;color:{color}">{em} {e.split(" ", 1)[1]}</div>'
+                steps_placeholder.markdown(display, unsafe_allow_html=True)
+            
+            try:
+                update_step(0, "running")
+                with st.spinner("Analyzing query..."):
+                    result = route(prompt)
+                update_step(0, "done")
+                
+                update_step(1, "done", "✅")
+                update_step(2, "done", "✅")
+                update_step(3, "done", "✅")
+                
+            except Exception as e:
+                update_step(0, "error")
+                st.error(f"Error: {e}")
+                result = {"error": str(e)}
+
+            # Clear steps after a delay
+            time.sleep(0.5)
+            steps_placeholder.empty()
 
             tool = result.get("tool", "")
             query_plan = result.get("query_plan")
