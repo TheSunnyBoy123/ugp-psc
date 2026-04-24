@@ -1,0 +1,25 @@
+# Data files
+*.csv
+*.npz
+
+# Python cache
+__pycache__/
+*.pyc
+*.pyo
+
+# Environment
+.env
+.env.example
+
+# OS files
+.DS_Store
+
+# Streamlit/pytest
+.streamlit/
+.pytest_cache/
+
+# Virtual env
+venv/
+
+# Embeddings cache
+.mp_cache/

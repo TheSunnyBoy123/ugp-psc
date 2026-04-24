@@ -1,0 +1,17 @@
+streamlit
+pandas
+langchain
+langchain-experimental
+langchain-google-genai
+google-generativeai
+tabulate
+python-dotenv
+scikit-learn
+numpy
+mp-api
+duckdb
+xgboost
+joblib
+category_encoders
+diskcache
+sentence-transformers
